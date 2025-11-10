@@ -7,11 +7,11 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 
 /**
- * @title HyperFillVault
- * @dev ERC4626 Vault for AI-powered market making on Sei
- * Users deposit SEI tokens and receive vault shares representing their portion of the pool
+ * @title GIVEXVault
+ * @dev ERC4626 Vault for AI-powered market making on Hedera
+ * Users deposit HBAR tokens and receive vault shares representing their portion of the pool
  */
-contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
+contract GIVEXVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
     
     // ===== EVENTS =====
     event LiquidityAdded(address indexed user, uint256 assets, uint256 shares);
@@ -22,15 +22,12 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
     event LiquidityReturned(address indexed user, address indexed fromWallet, uint256 amount);
     event AllCapitalReturned(address indexed user, address indexed fromWallet, uint256 amount);
     event ProfitsDeposited(uint256 amount);
-    event ManagementFeeSet(uint256 newFeeBps, uint256 oldFeeBps);
     event WithdrawalFeeSet(uint256 newFeeBps, uint256 oldFeeBps);
     event FeeRecipientSet(address indexed newRecipient, address indexed oldRecipient);
-    event FeesWithdrawn(
-        address indexed recipient, 
-        uint256 managementFees, 
-        uint256 withdrawalFees, 
-        uint256 totalFees
-    );  
+    event FeesWithdrawn(address indexed recipient, uint256 withdrawalFees);
+    event ImpactPoolSet(address indexed newPool, address indexed oldPool);
+    event ImpactPoolAllocation(address indexed user, uint256 profitAmount, uint256 allocationAmount);
+  
     
     // ===== STATE VARIABLES =====
     
@@ -41,7 +38,7 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
     mapping(address => uint256) public shareToUser;
     
     /// @notice Minimum deposit amount
-    uint256 public minDeposit = 1e18; // 1 SEI minimum
+    uint256 public minDeposit = 1e18; // 1 HBAR minimum
 
     /// @notice Maximum allocation percentage (basis points, 10000 = 100%)
     uint256 public maxAllocationBps = 9000; // 90% max allocation
@@ -52,100 +49,64 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
     /// @notice Array to keep track of all authorized agents
     address[] public authorizedAgentsList;
 
-    /// @notice Management fee (basis points per year, 10000 = 100%)
-    uint256 public managementFeeBps = 200; // 2% per year
-
     /// @notice Withdrawal fee (basis points, 10000 = 100%)
     uint256 public withdrawalFeeBps = 10; // 0.1% on withdrawal
 
     /// @notice Fee recipient address
     address public feeRecipient;
 
-    /// @notice Accumulated management fees
-    uint256 public accumulatedManagementFees;
-
-    /// @notice Accumulated withdrawal fees
+    /// @notice Accumulated withdrawal fees (remain in vault but excluded from share calculations)
     uint256 public accumulatedWithdrawalFees;
 
-    /// @notice Last fee calculation timestamp for management fees
-    uint256 public lastFeeCalculation;
+    /// @notice Impact pool address for profit allocation
+    address public impactPool;
+
+    /// @notice Track total amount deposited by each user (for accurate profit calculation)
+    mapping(address => uint256) public userTotalDeposited;
+
     
     // ===== CONSTRUCTOR =====
     
     /**
      * @dev Constructor
-     * @param _asset The underlying asset (SEI token address)
+     * @param _asset The underlying asset (HBAR token address)
      */
     constructor(
         IERC20 _asset
     ) 
         ERC4626(_asset) 
-        ERC20("HyperFillVault Shares", "HPF")
+        ERC20("GIVEX Vault Shares", "GIVEX")
         Ownable(msg.sender)
     {
-        lastFeeCalculation = block.timestamp; // Initialize fee tracking
     }
     
-    // ===== FEE CALCULATION FUNCTIONS =====
-    
-    /**
-     * @notice Calculate and accumulate management fees based on time elapsed
-     * @dev Calculates 2% annual fee on total AUM (Assets Under Management)
-     */
-    function calculateManagementFees() public {
-        uint256 timeElapsed = block.timestamp - lastFeeCalculation;
-        
-        // Only calculate if time has passed and there are assets to charge fees on
-        if (timeElapsed > 0 && _grossTotalAssets() > 0) {
-            // Calculate what 2% annual fee would be on current gross total assets
-            uint256 annualFeeAmount = (_grossTotalAssets() * managementFeeBps) / 10000;
-            
-            // Calculate proportional fee for the actual time that has elapsed
-            uint256 feeForThisPeriod = (annualFeeAmount * timeElapsed) / 365 days;
-            
-            // Add this period's fee to accumulated total
-            accumulatedManagementFees += feeForThisPeriod;
-            
-            // Update timestamp for next calculation
-            lastFeeCalculation = block.timestamp;
-        }
-    }
 
     /**
-     * @notice Get gross total assets (before fee deductions)
-     * @return Gross assets in the vault
-     */
-    function _grossTotalAssets() internal view returns (uint256) {
-        return IERC20(asset()).balanceOf(address(this));
-    }
-
-    /**
-     * @notice Override totalAssets to account for management fees
-     * @return Net assets after deducting accumulated and pending fees
+     * @notice Override totalAssets to exclude accumulated fees from share price calculation
+     * @return Total assets available to shareholders (excluding fees)
      */
     function totalAssets() public view override returns (uint256) {
-        uint256 grossAssets = _grossTotalAssets();
-        
-        // Calculate pending management fees
-        uint256 timeElapsed = block.timestamp - lastFeeCalculation;
-        uint256 pendingManagementFees = 0;
-        
-        if (timeElapsed > 0 && grossAssets > 0) {
-            uint256 annualFeeAmount = (grossAssets * managementFeeBps) / 10000;
-            pendingManagementFees = (annualFeeAmount * timeElapsed) / 365 days;
+        uint256 vaultBalance = IERC20(asset()).balanceOf(address(this));
+        // Exclude accumulated fees from share calculations
+        return vaultBalance > accumulatedWithdrawalFees ? vaultBalance - accumulatedWithdrawalFees : 0;
+    }
+
+    /**
+     * @notice Override previewRedeem to ensure complete withdrawal when vault becomes empty
+     */
+    function previewRedeem(uint256 shares) public view override returns (uint256) {
+        // If this is the last withdrawal (user has all shares), return all assets
+        if (shares == totalSupply()) {
+            return totalAssets();
         }
-        
-        uint256 totalFees = accumulatedManagementFees + accumulatedWithdrawalFees + pendingManagementFees;
-        
-        // Return net assets (gross assets minus all fees)
-        return grossAssets > totalFees ? grossAssets - totalFees : 0;
+        return super.previewRedeem(shares);
     }
     
     // ===== LIQUIDITY FUNCTIONS =====
     
     /**
      * @notice Add liquidity to the vault
-     * @param assets Amount of SEI tokens to deposit
+     * @param assets Amount of HBAR tokens to deposit
      * @return shares Number of vault shares minted
      */
     function depositLiquidity(uint256 assets) 
@@ -154,18 +115,19 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
         whenNotPaused 
         returns (uint256 shares) 
     {
-        // Calculate management fees before deposit
-        calculateManagementFees();
         
-        require(assets >= minDeposit, "HyperFillVault: Below minimum deposit");
-        require(assets > 0, "HyperFillVault: Cannot deposit zero");
+        require(assets >= minDeposit, "GIVEXVault: Below minimum deposit");
+        require(assets > 0, "GIVEXVault: Cannot deposit zero");
         
         // Calculate shares to mint using ERC4626 logic
         shares = previewDeposit(assets);
-        require(shares > 0, "HyperFillVault: Zero shares calculated");
+        require(shares > 0, "GIVEXVault: Zero shares calculated");
 
         // Update shareToUser mapping
         shareToUser[msg.sender] += shares;  
+        
+        // Track total deposited amount for profit calculation
+        userTotalDeposited[msg.sender] += assets;
         
         // Transfer assets from user to vault
         IERC20(asset()).transferFrom(msg.sender, address(this), assets);
@@ -179,39 +141,62 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
     }
     
     /**
-     * @notice Remove liquidity from the vault with withdrawal fee
-     * @return assets Amount of SEI tokens returned after withdrawal fee
+     * @notice Remove liquidity from the vault with withdrawal fee and optional impact pool allocation
+     * @param impactAllocationBps Percentage of profits to allocate to impact pool (basis points, 0-10000)
+     * @return assets Amount of tokens returned after withdrawal fee and impact allocation
      */
-    function withdrawProfits() 
+    function withdrawProfits(uint256 impactAllocationBps) 
         external 
         nonReentrant 
         whenNotPaused 
         returns (uint256 assets) 
     {
-        // Calculate management fees before withdrawal
-        calculateManagementFees();
-        
+        require(impactAllocationBps <= 10000, "GIVEXVault: Impact allocation cannot exceed 100%");
         uint256 shares = shareToUser[msg.sender];
-        require(shares > 0, "HyperFillVault: Cannot redeem zero shares");
-        require(balanceOf(msg.sender) >= shares, "HyperFillVault: Insufficient shares");
+        require(shares > 0, "GIVEXVault: Cannot redeem zero shares");
+        require(balanceOf(msg.sender) >= shares, "GIVEXVault: Insufficient shares");
 
         // Calculate gross assets to return using ERC4626 logic
         uint256 grossAssets = previewRedeem(shares);
-        require(grossAssets > 0, "HyperFillVault: Zero assets calculated");
+        require(grossAssets > 0, "GIVEXVault: Zero assets calculated");
 
-        // Calculate withdrawal fee (0.1%)
+        // Calculate profits: current value - total deposited
+        uint256 totalDeposited = userTotalDeposited[msg.sender];
+        uint256 profitAmount = grossAssets > totalDeposited ? grossAssets - totalDeposited : 0;
+        
+        // Calculate impact pool allocation from profits only
+        uint256 impactAllocation = 0;
+        if (profitAmount > 0 && impactAllocationBps > 0 && impactPool != address(0)) {
+            impactAllocation = (profitAmount * impactAllocationBps) / 10000;
+        }
+
+        // Calculate withdrawal fee on gross assets
         uint256 withdrawalFee = (grossAssets * withdrawalFeeBps) / 10000;
-        assets = grossAssets - withdrawalFee;
+        
+        // User receives: gross assets - withdrawal fee - impact allocation
+        assets = grossAssets - withdrawalFee - impactAllocation;
 
-        // Update accumulated withdrawal fees
-        accumulatedWithdrawalFees += withdrawalFee;
-
+        // Update user state first
         shareToUser[msg.sender] -= shares;
+        
+        // Reset user total deposited when fully withdrawing
+        userTotalDeposited[msg.sender] = 0;
         
         // Burn shares from user
         _burn(msg.sender, shares);
         
-        // Transfer net assets to user (after withdrawal fee)
+        // Accumulate fees (they stay in vault but don't count for share price)
+        if (withdrawalFee > 0) {
+            accumulatedWithdrawalFees += withdrawalFee;
+        }
+        
+        // Transfer impact allocation to impact pool if applicable
+        if (impactAllocation > 0) {
+            IERC20(asset()).transfer(impactPool, impactAllocation);
+            emit ImpactPoolAllocation(msg.sender, profitAmount, impactAllocation);
+        }
+        
+        // Transfer net assets to user
         IERC20(asset()).transfer(msg.sender, assets);
         
         emit LiquidityRemoved(msg.sender, assets, shares);
@@ -234,18 +219,18 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
         nonReentrant 
         whenNotPaused 
     {
-        require(authorizedAgents[msg.sender], "HyperFillVault: Agent not authorized");
-        require(amount > 0, "HyperFillVault: Cannot move zero amount");
-        require(tradingWallet != address(0), "HyperFillVault: Invalid trading wallet");
+        require(authorizedAgents[msg.sender], "GIVEXVault: Agent not authorized");
+        require(amount > 0, "GIVEXVault: Cannot move zero amount");
+        require(tradingWallet != address(0), "GIVEXVault: Invalid trading wallet");
         
-        // Check available liquidity (not already allocated)
+        // Check available liquidity (not already allocated, excluding fees)
         uint256 availableAssets = totalAssets() - totalAllocated;
-        require(amount <= availableAssets, "HyperFillVault: Insufficient available liquidity");
+        require(amount <= availableAssets, "GIVEXVault: Insufficient available liquidity");
         
         // Check allocation limits (90% max)
         uint256 newTotalAllocated = totalAllocated + amount;
         uint256 maxAllocation = (totalAssets() * maxAllocationBps) / 10000;
-        require(newTotalAllocated <= maxAllocation, "HyperFillVault: Exceeds max allocation");
+        require(newTotalAllocated <= maxAllocation, "GIVEXVault: Exceeds max allocation");
         
         // Update allocations
         totalAllocated += amount;
@@ -271,12 +256,10 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
         nonReentrant 
         whenNotPaused 
     {
-        // Calculate management fees before processing return
-        calculateManagementFees();
         
-        require(authorizedAgents[msg.sender], "HyperFillVault: Agent not authorized");
-        require(amount > 0, "HyperFillVault: Cannot move zero amount");
-        require(fromWallet != address(0), "HyperFillVault: Invalid source wallet");
+        require(authorizedAgents[msg.sender], "GIVEXVault: Agent not authorized");
+        require(amount > 0, "GIVEXVault: Cannot move zero amount");
+        require(fromWallet != address(0), "GIVEXVault: Invalid source wallet");
 
         uint256 capitalReturned = amount - profitAmount; 
         
@@ -298,14 +281,14 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
         nonReentrant 
         whenNotPaused 
     {
-        require(authorizedAgents[msg.sender], "HyperFillVault: Agent not authorized");
-        require(fromWallet != address(0), "HyperFillVault: Invalid source wallet");
+        require(authorizedAgents[msg.sender], "GIVEXVault: Agent not authorized");
+        require(fromWallet != address(0), "GIVEXVault: Invalid source wallet");
         
         uint256 allocatedAmount = totalAllocated;
         
         // Check wallet balance
         uint256 walletBalance = IERC20(asset()).balanceOf(fromWallet);
-        require(walletBalance >= allocatedAmount, "HyperFillVault: Insufficient balance in wallet");
+        require(walletBalance >= allocatedAmount, "GIVEXVault: Insufficient balance in wallet");
         
         // Calculate profit/loss
         uint256 totalToReturn = walletBalance; // Return everything in wallet
@@ -334,7 +317,7 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
      * @param agent Agent address to authorize
      */
     function addAuthorizedAgent(address agent) external onlyOwner {
-        require(agent != address(0), "HyperFillVault: Invalid agent address");
+        require(agent != address(0), "GIVEXVault: Invalid agent address");
         authorizedAgents[agent] = true;
         authorizedAgentsList.push(agent);
     }
@@ -360,7 +343,7 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
      * @param newMaxBps New maximum allocation in basis points
      */
     function setMaxAllocation(uint256 newMaxBps) external onlyOwner {
-        require(newMaxBps <= 10000, "HyperFillVault: Cannot exceed 100%");
+        require(newMaxBps <= 10000, "GIVEXVault: Cannot exceed 100%");
         maxAllocationBps = newMaxBps;
     }
     
@@ -386,29 +369,43 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
         _unpause();
     }
 
-    // ===== FEE MANAGEMENT =====
+    /**
+     * @notice Set impact pool address
+     * @param newImpactPool Address of the impact pool
+     */
+    function setImpactPool(address newImpactPool) external onlyOwner {
+        require(newImpactPool != address(0), "GIVEXVault: Invalid impact pool address");
+        address oldImpactPool = impactPool;
+        impactPool = newImpactPool;
+        emit ImpactPoolSet(newImpactPool, oldImpactPool);
+    }
 
     /**
-     * @notice Set management fee rate
-     * @param newFeeBps New management fee in basis points per year (max 500 = 5%)
+     * @notice Deposit liquidity directly to vault without creating shares (simulate profits)
+     * @param amount Amount of tokens to deposit
      */
-    function setManagementFee(uint256 newFeeBps) external onlyOwner {
-        require(newFeeBps <= 500, "HyperFillVault: Management fee too high"); // Max 5%
+    function depositLiquidityWithoutShares(uint256 amount) 
+        external 
+        nonReentrant 
+        whenNotPaused 
+    {
+        require(authorizedAgents[msg.sender] || msg.sender == owner(), "GIVEXVault: Not authorized");
+        require(amount > 0, "GIVEXVault: Cannot deposit zero");
         
-        // Calculate any pending fees with the OLD rate before changing
-        calculateManagementFees();
+        // Transfer tokens to vault without minting shares (increases share price)
+        IERC20(asset()).transferFrom(msg.sender, address(this), amount);
         
-        uint256 oldFeeBps = managementFeeBps;
-        managementFeeBps = newFeeBps;
-        emit ManagementFeeSet(newFeeBps, oldFeeBps);
+        emit ProfitsDeposited(amount);
     }
+
+    // ===== FEE MANAGEMENT =====
 
     /**
      * @notice Set withdrawal fee rate
      * @param newFeeBps New withdrawal fee in basis points (max 100 = 1%)
      */
     function setWithdrawalFee(uint256 newFeeBps) external onlyOwner {
-        require(newFeeBps <= 100, "HyperFillVault: Withdrawal fee too high"); // Max 1%
+        require(newFeeBps <= 100, "GIVEXVault: Withdrawal fee too high"); // Max 1%
         uint256 oldFeeBps = withdrawalFeeBps;
         withdrawalFeeBps = newFeeBps;
         emit WithdrawalFeeSet(newFeeBps, oldFeeBps);
@@ -419,45 +416,39 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
      * @param newRecipient Address to receive fees
      */
     function setFeeRecipient(address newRecipient) external onlyOwner {
-        require(newRecipient != address(0), "HyperFillVault: Invalid fee recipient");
+        require(newRecipient != address(0), "GIVEXVault: Invalid fee recipient");
         address oldRecipient = feeRecipient;
         feeRecipient = newRecipient;
         emit FeeRecipientSet(newRecipient, oldRecipient);
     }
 
+
     /**
-     * @notice Withdraw all accumulated fees
+     * @notice Withdraw accumulated fees to fee recipient
      */
     function withdrawFees() external {
         require(
             msg.sender == feeRecipient || msg.sender == owner(), 
-            "HyperFillVault: Not authorized to withdraw fees"
+            "GIVEXVault: Not authorized to withdraw fees"
         );
-        require(feeRecipient != address(0), "HyperFillVault: No fee recipient set");
+        require(feeRecipient != address(0), "GIVEXVault: No fee recipient set");
         
-        // Calculate any pending management fees first
-        calculateManagementFees();
-        
-        uint256 managementFees = accumulatedManagementFees;
         uint256 withdrawalFees = accumulatedWithdrawalFees;
-        uint256 totalFees = managementFees + withdrawalFees;
-        
-        require(totalFees > 0, "HyperFillVault: No fees to withdraw");
+        require(withdrawalFees > 0, "GIVEXVault: No fees to withdraw");
         
         // Reset accumulated fees
-        accumulatedManagementFees = 0;
         accumulatedWithdrawalFees = 0;
         
         // Transfer fees
-        IERC20(asset()).transfer(feeRecipient, totalFees);
+        IERC20(asset()).transfer(feeRecipient, withdrawalFees);
         
-        emit FeesWithdrawn(feeRecipient, managementFees, withdrawalFees, totalFees);
+        emit FeesWithdrawn(feeRecipient, withdrawalFees);
     }
     
     // ===== VIEW FUNCTIONS =====
     
     /**
-     * @notice Get available liquid assets (not allocated to agents)
+     * @notice Get available liquid assets (not allocated to agents, excluding fees)
      * @return Available assets amount
      */
     function getAvailableAssets() external view returns (uint256) {
@@ -508,27 +499,69 @@ contract HyperFillVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Preview pending management fees without updating state
-     * @return Amount of management fees that would be calculated now
+     * @notice Get total accumulated withdrawal fees
+     * @return Total withdrawal fees accumulated
      */
-    function previewManagementFees() external view returns (uint256) {
-        uint256 timeElapsed = block.timestamp - lastFeeCalculation;
-        
-        if (timeElapsed == 0 || _grossTotalAssets() == 0) {
-            return accumulatedManagementFees;
-        }
-        
-        uint256 annualFeeAmount = (_grossTotalAssets() * managementFeeBps) / 10000;
-        uint256 feeForPeriod = (annualFeeAmount * timeElapsed) / 365 days;
-        
-        return accumulatedManagementFees + feeForPeriod;
+    function getTotalAccumulatedFees() external view returns (uint256) {
+        return accumulatedWithdrawalFees;
+    }
+
+    /** 
+     * @notice Get vault state for debugging
+     * @return vaultBalance The vault's actual token balance
+     * @return totalAssetsValue Total assets available to shareholders (excluding fees)
+     * @return totalSupplyValue Total supply of vault shares
+     * @return sharePrice Current price of 1 share
+     * @return accumulatedFees Total accumulated withdrawal fees
+     */
+    function getVaultState() external view returns (
+        uint256 vaultBalance,
+        uint256 totalAssetsValue,
+        uint256 totalSupplyValue,
+        uint256 sharePrice,
+        uint256 accumulatedFees
+    ) {
+        vaultBalance = IERC20(asset()).balanceOf(address(this));
+        totalAssetsValue = totalAssets();
+        totalSupplyValue = totalSupply();
+        sharePrice = totalSupply() == 0 ? 1e18 : (totalAssets() * 1e18) / totalSupply();
+        accumulatedFees = accumulatedWithdrawalFees;
     }
 
     /**
-     * @notice Get total accumulated fees
-     * @return Total management and withdrawal fees accumulated
+     * @notice Preview withdrawal fee for a given amount
+     * @param assets Amount of assets to preview fee for
+     * @return Fee amount that would be charged
      */
-    function getTotalAccumulatedFees() external view returns (uint256) {
-        return accumulatedManagementFees + accumulatedWithdrawalFees;
+    function previewWithdrawalFee(uint256 assets) external view returns (uint256) {
+        return (assets * withdrawalFeeBps) / 10000;
+    }
+
+    /**
+     * @notice Calculate user's current profit amount
+     * @param user User address
+     * @return profitAmount Current profit in underlying assets
+     */
+    function getUserProfits(address user) external view returns (uint256 profitAmount) {
+        uint256 shares = shareToUser[user];
+        if (shares == 0) return 0;
+        
+        uint256 currentValue = (shares * totalAssets()) / totalSupply();
+        uint256 totalDeposited = userTotalDeposited[user];
+        
+        if (currentValue > totalDeposited) {
+            profitAmount = currentValue - totalDeposited;
+        }
+        
+        return profitAmount;
+    }
+
+    /**
+     * @notice Get user's total deposited amount
+     * @param user User address
+     * @return Total amount deposited by user
+     */
+    function getUserTotalDeposited(address user) external view returns (uint256) {
+        return userTotalDeposited[user];
     }
 }
